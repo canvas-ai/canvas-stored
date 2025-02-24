@@ -11,5 +11,8 @@
   "author": "me@idnc.sk",
   "license": "ISC",
   "dependencies": {
+    "cacache": "^19.0.1",
+    "file-type": "^20.2.0",
+    "fs-extra": "^11.3.0"
   }
 }
