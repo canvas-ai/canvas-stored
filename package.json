@@ -12,6 +12,7 @@
   "license": "ISC",
   "dependencies": {
     "cacache": "^19.0.1",
+    "eventemitter2": "^6.4.9",
     "file-type": "^20.2.0",
     "fs-extra": "^11.3.0"
   }
