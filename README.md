@@ -1,6 +1,6 @@
 # StoreD
 
-Naive implementation of a simple CRUD data storage/retrieval middleware that aims to abstract different storage backends under a simple API.
+Simple context-addressible BLOB storage middleware that aims to abstract different storage backends under a simple API.
 
 ## Architecture
 
@@ -9,10 +9,9 @@ Naive implementation of a simple CRUD data storage/retrieval middleware that aim
   - `fs`
   - `file`
   - `s3`
-  - `lmdb`
   - `..at some point we'll probably throw in a rclone wrapper`
 - nodejs streams(yey)
-- Versioning is supported at the index level, all attempts at implementing versioning in this module were dropped
+- no versioning support (should be done at the index - in our case synapsd - level)
 
 ## Use-case in combination with indexD
 
@@ -20,56 +19,8 @@ Retrieving **piano-rec-02.mp3** with checksums [sha1-.., sha256-..] located on s
 
 ## Config
 
-Configuration paths:  
-`$ CANVAS_USER_CONFIG/stored.json`  
-`$ CANVAS_USER_WORKSPACES/<workspace-id>/config/stored.json`  
-`$ CANVAS_USER_CONFIG/stored.backends.json`  
-`$ CANVAS_USER_CONFIG/stored.cache.json`
+### TBD
 
-Example configuration (backend:driver:config):
-
-```json
-{
-    "cache": {
-        "enabled": "true",
-        "rootPath": "CANVAS_USER_CACHE"
-    },
-    "backends": {
-        "local": {
-            "file": {
-                "enabled": true,
-                "localCacheEnabled": false,
-                "permissions": "rw",
-                "dataAbstractions": [],
-                "driver": "file",
-            },
-            "db": {
-                "enabled": true,
-                "localCacheEnabled": false,
-                "permissions": "rw",
-                "dataAbstractions": [],
-                "driver": "lmdb",
-                "driverConfig": {}
-            }
-        },
-        "home": {
-            "s3@nas": {
-                "enabled": true,
-                "localCacheEnabled": true,
-                "driver": "s3",
-                "driverConfig": {},
-                "permissions": "rw",
-                "dataAbstractions": []                
-            },
-            "s3@ws": {
-                "enabled": true,
-                "localCacheEnabled": true,                
-                "driver": "s3",
-                "driverConfig": {}
-            }
-        }
-    }
-}
 ```
 
 ### Common StoreD paths
