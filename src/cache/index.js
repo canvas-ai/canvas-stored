@@ -1,93 +1,49 @@
-'use strict';
+import cacache from 'cacache';
+import Debug from 'debug';
 
+const debug = Debug('stored:cache');
 
-/**
- * Cache interface
- */
-
-// Utils
-const debug = require('debug')('canvas:stored:cache');
-
-// Includes
-const cacache = require('cacache');
-
-// Default cache configuration
-const DEFAULT_CONFIG = {
-    algorithms: ['sha1'],
-};
-
-class Cache {
-
-    #config;
-    #cacheRoot;
+export default class Cache {
+    #root;
+    #algorithms;
 
     constructor(config) {
-        debug('Initializing Canvas StoreD caching layer..');
-        if (!config.rootPath || typeof config.rootPath !== 'string') {
-            throw new Error('Cache rootPath not defined');
-        }
-
-        this.#config = {
-            ...DEFAULT_CONFIG,
-            ...config
-        };
-
-        this.#cacheRoot = config.rootPath;
-        debug(`Canvas StoreD cache initialized, cache root at "${this.#cacheRoot}"`);
+        if (!config?.path) throw new Error('Cache path required');
+        this.#root = config.path;
+        this.#algorithms = config.algorithms || ['sha256'];
+        debug(`Cache initialized at "${this.#root}"`);
     }
 
-    list() {
-        return cacache.ls(this.#cacheRoot);
-    }
+    get root() { return this.#root; }
 
-    listAsStream() {
-        return cacache.ls.stream(this.#cacheRoot);
-    }
+    list() { return cacache.ls(this.#root); }
 
-    has(key) {
-        return cacache.get.info(this.#cacheRoot, key);
-    }
+    has(key) { return cacache.get.info(this.#root, key); }
 
     put(key, data, metadata = {}) {
-        return cacache.put(this.#cacheRoot, key, data, {
-            ...this.#config,
-            metadata: metadata
-        });
+        return cacache.put(this.#root, key, data, { algorithms: this.#algorithms, metadata });
     }
 
-    putAsStream(key, metadata = {}) {
-        return cacache.put.stream(this.#cacheRoot, key, {
-            ...this.#config,
-            metadata: metadata
-        });
+    putStream(key, metadata = {}) {
+        return cacache.put.stream(this.#root, key, { algorithms: this.#algorithms, metadata });
     }
 
-    get(key, metadataOnly = false) {
-        return (metadataOnly) ? this.getMetadata(key) : cacache.get(this.#cacheRoot, key);
-    }
+    get(key) { return cacache.get(this.#root, key); }
 
-    getMetadata(key) {
-        return cacache.get.info(this.#cacheRoot, key);
-        // This can introduce problems, but hey, we can handle it in stored
-        // A better implementation would be to strip cacache metadata
-        // const metadata = cacache.get.info(this.#cacheRoot, key);
-        // if (!metadata.checksum) { metadata.checksums[defaultAlgo] = metadata.integrity; }
-        // return metadata.metadata;
-    }
+    getStream(key) { return cacache.get.stream(this.#root, key); }
 
-    getAsStream(key) {
-        return cacache.get.stream(this.#cacheRoot, key);
-    }
+    getInfo(key) { return cacache.get.info(this.#root, key); }
 
-    getInfo(key) {
-        return cacache.get.info(this.#cacheRoot, key);
-    }
+    delete(key) { return cacache.rm.entry(this.#root, key, { removeFully: true }); }
 
-    delete(key, destroy = true) {
-        return cacache.rm.entry(this.#cacheRoot, key, { removeFully: destroy });
-    }
+    clear() { return cacache.rm.all(this.#root); }
 
-    verify() { return cacache.verify(this.#cacheRoot); }
+    verify() { return cacache.verify(this.#root); }
+
+    async stats() {
+        const entries = await this.list();
+        const keys = Object.keys(entries);
+        const totalSize = keys.reduce((sum, k) => sum + (entries[k].size || 0), 0);
+        return { entries: keys.length, size: totalSize };
+    }
 }
-
-module.exports = Cache;
