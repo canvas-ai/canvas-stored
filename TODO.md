@@ -4,35 +4,26 @@ We'll design a simple CRUD data storage/retrieval middleware that aims to abstra
 
 ! This module only abstracts blob backends - mailboxes/git/etc live in separate connectors
 
-## API (draft)
+## API
 
 ### Core (MVP)
 
 - **put(blob, { key?, backends?, metadata? })** → `PutResult`  
   Store a blob. Auto-detects Buffer/Stream/path.  
-  Always returns the canonical metadata record.  
-  key is optional; if omitted, StoreD generates one based on checksum.   
+  Returns the canonical metadata record including sync status for each backend.  
+  key is optional; if omitted, StoreD generates one based on checksum.
 
-- **get(idOrKey, { stream?, backend? })** → `Buffer | Stream`  
-  Retrieve by checksum (`sha256:...`) or key/path.  
-  Options: `{ stream?: boolean, backends?: string[] }`
+- **get(idOrChecksum, { stream?, backend? })** → `Buffer | Stream`  
+  Retrieve by checksum (`sha256:...`) or key/path.
 
-- **delete(idOrKey, { backends? }) → { removed: string[] }** → `{ deleted: string[] }`
+- **delete(idOrChecksum, { backends? })** → `{ deleted: string[] }`
 
-- **list({ backend?, prefix?, limit? })** → `AsyncIterable<{ key, checksum, size }>`  
-  Options: `{ backend?: string, prefix?: string, limit?: number }`
+- **list({ backend?, prefix?, limit? })** → `AsyncIterable<{ key, checksum, size }>`
 
-- **stat(idOrKey)** → `Metadata | null`
+- **stat(idOrChecksum)** → `Metadata | null`
 
-- **has(idOrKey)** → `boolean`  
+- **has(idOrChecksum)** → `boolean`  
   Thin wrapper around stat.
-
-- 
-
-We need to track to which backends a object should be synced and whether its synced or not  
-We should emit appropriate events on all common operations  
-Response object for put ops should contain at least the above details  
-
 
 ### Backend Management
 
@@ -49,25 +40,26 @@ Every backend must implement:
 - stat(key) → { size, modified } | null
 - watch?(emitCb) → void     // optional for remote backends
 
-### Cache management
+### Cache Management
 
-- cache.stats() – size, entries, hits/misses.
-- cache.evict(pattern | oldest | oversized)
-- cache.clear()
+- **cache.stats()** – size, entries, hits/misses
+- **cache.evict(pattern | oldest | oversized)**
+- **cache.clear()**
+
+Config: `{ maxSize, location, evictionPolicy }`
 
 ### Events
 
-- stored.on('put',       ({ checksum, key }))  
-- stored.on('delete',    ({ checksum, key, backends }))  
+- stored.on('put',           ({ checksum, key, metadata }))  
+- stored.on('delete',        ({ checksum, key, backends }))  
 - stored.on('sync:start',    ({ checksum, backend }))  
 - stored.on('sync:complete', ({ checksum, backend }))  
 - stored.on('sync:error',    ({ checksum, backend, error }))  
 - stored.on('watch',         ({ type, key, backend })) // add|mod|del
 
-
 ## Architecture
 
-### Metadata object(draft)
+### Metadata Object
 
 ```json
 {
@@ -91,7 +83,7 @@ Every backend must implement:
 }
 ```
 
-### Backend drivers we should implement for the MVP:
+### Backend Drivers (MVP)
 
 | Driver | Type | Watch Support |
 |--------|------|---------------|
@@ -109,38 +101,36 @@ Implementation pattern: `class FsBackend extends StorageBackend`
 
 Implementation should be flexible enough to easily add additional backends like smb, azure blob storage or supabase or even wrap rclone
 
-### Caching (`cacache`)
-
-- Remote GETs cached locally
-- Remote PUTs go to cache first, then SyncD queue
-- Config: `{ maxSize, location, evictionPolicy }`
-
 ### Services
 
-| Service | Purpose |
-|---------|---------|
-| **ChecksumD** | Background/on-ingest checksum calculation (default: sha256)|
-| **WatchD** | Per-backend file watching, emits change events |
-| **SyncD** | Queue-based sync to remote backends, retries, status tracking |
-| **Index** | LMDB-backed checksum → metadata lookup (optional for MVP?) |
+#### ChecksumD
 
-#### ChecksumD (keep)
+- Mandatory for ingestion only
+- Do not checksum remote blobs on-the-fly—only local
 
-- mandatory for ingestion only
-- do not checksum remote blobs on-the-fly—only local
+#### WatchD
 
-#### WatchD (keep)
-
-- only for backends that support it (fs)
+- Only for backends that support it (fs)
 - S3 should not pretend to watch; use polling or disable entirely
 
-#### SyncD (keep)
+#### SyncD
 
-- retries, exponential backoff, observability
+- Retries, exponential backoff, observability
 
-#### Index (optional MVP)
+**Queue requirements (LMDB-backed):**
+- append job
+- iterate jobs in order
+- mark as completed / failed
+- retry strategy
+- ability to survive restart
+- atomic operations
+- counters, timestamps
 
-We can skip it for an MVP but LMDB would be a nice fit long-term
+Not needed: cluster mode, pub/sub, cron expressions, priorities
+
+#### Index (required)
+
+LMDB-backed checksum → metadata lookup. Required for persistence and efficient lookups.
 
 ## Config
 
@@ -166,10 +156,10 @@ We can skip it for an MVP but LMDB would be a nice fit long-term
 }
 ```
 
-## Design decisions
+## Design Decisions
 
 - Keep StoreD stupid
-- Treat metadata as canonical “truth”
+- Treat metadata as canonical "truth"
 - If FS fails and S3 exists, do not silently fall back unless explicitly requested
 - Keep events few and clean
 
@@ -196,8 +186,7 @@ InternalBlob = {
 }
 ```
 
-This prevents bugs where streams are consumed multiple times.  
-Implementation
+This prevents bugs where streams are consumed multiple times.
 
 - Buffer → size known, read() returns a fresh Readable from the buffer
 - File path → size from stat(), read() returns fs.createReadStream
@@ -205,8 +194,7 @@ Implementation
 
 ### ChecksumD: Compute Checksums
 
-Compute required checksums **before** writing anywhere.  
-Flow:
+Compute required checksums **before** writing anywhere.
 
 ```
 const stream = blob.read()
@@ -215,10 +203,9 @@ const checksums = await checksumD.compute(stream)
 
 - Primary ID = id = sha256:abcdef...  
 - Side checksums allowed: xxh3, sha1, etc.  
-- ! Rewind the blob afterwards by calling blob.read() again.
-Never reuse the checksum stream.
+- ! Rewind the blob afterwards by calling blob.read() again. Never reuse the checksum stream.
 
-### Decide the final key
+### Decide the Final Key
 
 The key is:
  - if user provided: key
@@ -231,14 +218,14 @@ Using directory fan-out avoids filesystem performance issues.
 
 ### Write to Local Cache First
 
-- Local cache is your “universal staging area”  
+- Local cache is your "universal staging area"  
   `await cache.put(id, blob)`
 
 - Guarantees:
   - No remote backend can cause ingest slowdown.
   - Checksumming and indexing operate on local copies.
-  - Remote failures won’t corrupt or block ingestion.
-- Emit `stored.emit('put', { checksum: id, key })` - Should we emit the full metadata object here?
+  - Remote failures won't corrupt or block ingestion.
+- Emit `stored.emit('put', { checksum: id, key, metadata })`
 
 ### Insert/Update Index
 
@@ -270,7 +257,6 @@ syncD.enqueue({
 ```
 locations entry is only updated after sync completes.
 
-
 ### SyncD (async)
 
 ```
@@ -295,7 +281,7 @@ They are entirely async, event-driven.
 
 ### Updating Metadata After Sync Completion
 
-markLocationSynced(id, backend, key)?
+markLocationSynced(id, backend, key):
 ```
 meta = index.get(id)
 
@@ -309,33 +295,122 @@ index.put(id, meta)
 
 ### Return the Put Result Immediately
 
-put() returns before any remote sync.
+put() returns before any remote sync. Returns the full Metadata object (see Architecture > Metadata Object).
+
+## Flow (GET)
+
+### Input
+
+**get(idOrChecksum, { stream?, backend? })**
+
+- idOrChecksum: checksum (`sha256:...`) or key/path
+- stream: if true, return Stream instead of Buffer
+- backend: specific backend to fetch from (optional)
+
+### Lookup
+
+1. Check cache first:
+   ```
+   cached = cache.get(idOrChecksum, { stream })
+   if (cached) return cached
+   ```
+
+2. Query Index for metadata:
+   ```
+   meta = index.get(idOrChecksum)
+   if (!meta) throw NotFoundError
+   ```
+
+3. Find available location:
+   ```
+   location = meta.locations.find(loc => loc.synced)
+   if (!location) throw NotFoundError
+   ```
+
+### Fetch from Backend
 
 ```
-{
-  id,
-  key,
-  checksums,
-  size,
-  mimeType,
-  locations: meta.locations,   // only cache/local visible so far
-  custom: meta.custom
+backend = getBackend(location.backend)
+data = await backend.get(location.key, { stream })
+```
+
+### Cache Remote Fetches
+
+If fetched from a remote backend, cache locally for future access:
+```
+if (backend.type === 'remote') {
+  cache.put(idOrChecksum, data)
 }
 ```
 
-## SyncD will require a simple LMDB based queue
+### Return
 
-Queue features:
-- append job
-- iterate jobs in order
-- mark as completed / failed
-- retry strategy
-- ability to survive restart
-- atomic operations
-- counters, timestamps
+Return Buffer or Stream based on options.stream flag.
 
-We do not need
-- cluster mode
-- pub/sub
-- cron expressions
-- priorities
+## Flow (DELETE)
+
+### Input
+
+**delete(idOrChecksum, { backends? })**
+
+- idOrChecksum: checksum (`sha256:...`) or key/path
+- backends: specific backends to delete from (optional, defaults to all locations)
+
+### Lookup
+
+```
+meta = index.get(idOrChecksum)
+if (!meta) throw NotFoundError
+```
+
+### Determine Targets
+
+```
+targets = options.backends 
+  ? meta.locations.filter(loc => options.backends.includes(loc.backend))
+  : meta.locations
+```
+
+### Remove from Cache
+
+```
+cache.delete(idOrChecksum)
+```
+
+### Queue Deletion from Backends
+
+For each target location:
+```
+syncD.enqueue({
+  type: 'delete',
+  id: idOrChecksum,
+  key: location.key,
+  backend: location.backend,
+})
+```
+
+### Update Index
+
+If deleting from all backends:
+```
+index.delete(idOrChecksum)
+```
+
+If deleting from specific backends only:
+```
+meta.locations = meta.locations.filter(loc => !targets.includes(loc))
+meta.modified = Date.now()
+index.put(idOrChecksum, meta)
+```
+
+### Emit Event
+
+```
+emit('delete', { checksum: idOrChecksum, key, backends: targets.map(t => t.backend) })
+```
+
+### Return
+
+```
+{ deleted: targets.map(t => t.backend) }
+```
