@@ -9,7 +9,7 @@
     "start": "node ./src/index.js"
   },
   "author": "me@idnc.sk",
-  "license": "ISC",
+  "license": "AGPL-3.0-or-later",
   "dependencies": {
     "cacache": "^19.0.1",
     "eventemitter2": "^6.4.9",
