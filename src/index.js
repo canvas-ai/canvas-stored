@@ -159,11 +159,20 @@ export default class Stored extends EventEmitter {
             for (const file of files) {
                 if (file.checksums) {
                     const id = formatId(file.checksums, this.#config.primaryChecksum);
+                    const existing = this.#index.get(id);
+                    const location = { backend: file.backend, key: file.key, synced: true };
+
+                    // Merge locations
+                    const locations = existing?.locations || [];
+                    if (!locations.some(l => l.backend === file.backend && l.key === file.key)) {
+                        locations.push(location);
+                    }
+
                     this.#index.put(id, {
                         checksums: file.checksums,
                         size: file.size,
                         mimeType: file.mimeType,
-                        locations: [{ backend: file.backend, key: file.key, synced: true }],
+                        locations,
                     });
                 }
             }
@@ -222,16 +231,62 @@ export default class Stored extends EventEmitter {
     }
 
     #handleFileEvent(event, data) {
-        if (data.checksums && event !== 'file:unlink') {
+        const pathKey = `${data.backend}:${data.key}`;
+        const location = { backend: data.backend, key: data.key, synced: true };
+
+        if (event === 'file:add' && data.checksums) {
             const id = formatId(data.checksums, this.#config.primaryChecksum);
+            const existing = this.#index.get(id);
+
+            // Merge locations - same content might exist in multiple paths
+            const locations = existing?.locations || [];
+            if (!locations.some(l => l.backend === data.backend && l.key === data.key)) {
+                locations.push(location);
+            }
+
             this.#index.put(id, {
                 checksums: data.checksums,
                 size: data.size,
                 mimeType: data.mimeType,
-                locations: [{ backend: data.backend, key: data.key, synced: true }],
+                locations,
             });
+            this.emit(event, { ...data, id, locations });
+
+        } else if (event === 'file:change' && data.checksums) {
+            // File changed = content changed = new checksum
+            // First, remove old location from previous checksum entry
+            const oldMeta = this.#index.get(pathKey);
+            if (oldMeta) {
+                oldMeta.locations = oldMeta.locations.filter(l =>
+                    !(l.backend === data.backend && l.key === data.key)
+                );
+                if (oldMeta.locations.length === 0) {
+                    this.#index.delete(oldMeta.id);
+                } else {
+                    this.#index.put(oldMeta.id, oldMeta);
+                }
+                // Emit that old content was removed from this path
+                this.emit('file:unlink', { ...data, id: oldMeta.id, checksums: oldMeta.checksums });
+            }
+
+            // Then add new location to new checksum entry
+            const newId = formatId(data.checksums, this.#config.primaryChecksum);
+            const existing = this.#index.get(newId);
+            const locations = existing?.locations || [];
+            if (!locations.some(l => l.backend === data.backend && l.key === data.key)) {
+                locations.push(location);
+            }
+
+            this.#index.put(newId, {
+                checksums: data.checksums,
+                size: data.size,
+                mimeType: data.mimeType,
+                locations,
+            });
+            this.emit('file:add', { ...data, id: newId, locations });
+
         } else if (event === 'file:unlink') {
-            const pathKey = `${data.backend}:${data.key}`;
+            // Lookup metadata from index before removal (file is gone, no checksums)
             const meta = this.#index.get(pathKey);
             if (meta) {
                 meta.locations = meta.locations.filter(l =>
@@ -242,8 +297,11 @@ export default class Stored extends EventEmitter {
                 } else {
                     this.#index.put(meta.id, meta);
                 }
+                // Emit with full metadata so consumers know what was removed
+                this.emit(event, { ...data, id: meta.id, checksums: meta.checksums, locations: meta.locations });
+            } else {
+                this.emit(event, data);
             }
         }
-        this.emit(event, data);
     }
 }
