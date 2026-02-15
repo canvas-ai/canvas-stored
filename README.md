@@ -1,104 +1,91 @@
 # StoreD
 
-Simple CRUD data storage middleware abstracting blob storage backends under a unified API.
+Cache-first blob storage middleware with background sync to multiple backends abstracting blob storage backends under a unified API.
 
-## Installation
+In combination with canvas-server/synapsd, it enables users to construct virtual "context" 
+or directory "file-system-like" tree views on top of indexed data, supporting fine-grained 
+store and replication policies and context-aware data retrieval.
 
-```bash
-npm install
-```
+All writes hit the local cacache first (fast, content-addressable), then sync to backends:
+- **Local backends** (file): written immediately after cache
+- **Remote backends** (S3, SMB, etc.): synced via off-thread worker queue
+
+Reads check cache first, fall back to backend, and cache on read.
 
 ## Usage
 
 ```js
 import Stored from './src/index.js';
 
-const stored = new Stored({ 
-  index: { path: './.index' },        // LMDB-backed persistent index
-  cache: { path: './.cache' },        // optional cache
-  checksums: ['sha256', 'md5'],       // algorithms to compute
-  primaryChecksum: 'sha256',          // used for canonical id
+const stored = new Stored({
+  index: { path: './.index' },
+  cache: { path: './.cache' },          // optional — auto-derived from index path
+  checksums: ['sha256'],
+  primaryChecksum: 'sha256',
 });
 
-// Add file backends
-stored.addBackend('fs:data', { driver: 'file', root: './data', watch: true });
-stored.addBackend('fs:archive', { driver: 'file', root: './archive' });
+// Add backends (home dir is just a backend config)
+stored.addBackend('fs:home', { driver: 'file', root: './home', watch: true });
 
-// Listen for file changes
-stored.on('file:add', ({ key, checksums, mimeType }) => console.log('New:', key));
-stored.on('file:change', ({ key, checksums }) => console.log('Modified:', key));
-stored.on('file:unlink', ({ key }) => console.log('Deleted:', key));
+// Listen for file changes (from watcher)
+stored.on('file:add', ({ id, key, checksums }) => console.log('New:', key));
+stored.on('file:unlink', ({ id, key }) => console.log('Deleted:', key));
+stored.on('synced', ({ id, results }) => console.log('Synced:', results));
 
-// Index existing files
-await stored.scan();
-
-// Store data
+// Store data (cache-first → backends)
 const meta = await stored.put(Buffer.from('content'), { key: 'path/file.txt' });
-// Returns: { id, checksums, size, mimeType, locations, created, modified, custom }
 
-// Retrieve by id or path
+// Retrieve (cache-first → backend fallback → cache on read)
 const data = await stored.get(meta.id);
 
-// Check existence
-stored.has(meta.id); // true
-
-// Get metadata
+// Metadata & existence
 stored.stat(meta.id);
+stored.has(meta.id);
 
-// List all indexed files
-for await (const entry of stored.list()) {
-  console.log(entry.id, entry.size, entry.mimeType);
-}
-
-// Delete
-await stored.delete(meta.id);
+// Scan existing files on backends
+await stored.scan();
 
 // Cleanup
 await stored.stop();
 ```
 
-## Metadata Object
+## Architecture
 
-```json
-{
-  "id": "sha256:abc123...",
-  "checksums": {
-    "sha256": "abc123...",
-    "md5": "def456..."
-  },
-  "size": 12345,
-  "mimeType": "image/png",
-  "locations": [
-    { "backend": "fs:data", "key": "path/file.png", "synced": true }
-  ],
-  "created": 1732844100000,
-  "modified": 1732844100000,
-  "custom": {}
-}
 ```
+put(blob)
+  → cacache (local, fast, content-addressable)
+  → local backends (immediate write)
+  → remote backends (worker_threads queue)
+
+get(id)
+  → cacache hit? return
+  → backend read → cache on read → return
+```
+
+Workspace integration: the workspace owns a Stored instance. The home directory is `{ driver: 'file', root: './home', watch: true }` — just another backend entry. SynapsD sync (indexing files as documents) is orchestration in the workspace layer, driven by Stored events.
 
 ## API
 
 | Method | Description |
 |--------|-------------|
-| `put(blob, options?)` | Store buffer/stream/file path |
-| `get(id, options?)` | Retrieve by id or path |
-| `delete(id, options?)` | Remove from backends |
+| `put(blob, options?)` | Cache-first store, then sync to backends |
+| `get(id, options?)` | Cache-first retrieve, backend fallback |
+| `delete(id, options?)` | Remove from cache + backends |
 | `stat(id)` | Get metadata |
-| `has(id)` | Check if exists |
+| `has(id)` | Check existence |
 | `list(options?)` | Iterate indexed entries |
-| `scan(backend?)` | Index existing files |
-| `addBackend(name, config)` | Register a backend |
-| `removeBackend(name)` | Unregister a backend |
-| `listBackends()` | List registered backends |
-| `stop()` | Stop watchers and cleanup |
+| `scan(backend?)` | Index existing files from backends |
+| `addBackend(name, config)` | Register a storage backend |
+| `stop()` | Stop watchers, sync queue, cleanup |
 
 ## Events
 
-- `file:add` - New file detected
-- `file:change` - File modified
-- `file:unlink` - File deleted
-- `scan:start` - Indexing started
-- `scan:complete` - Indexing finished
-- `put` - Data stored
-- `delete` - Data deleted
+| Event | Description |
+|-------|-------------|
+| `file:add` | New file detected (watcher) |
+| `file:change` | File modified (watcher) |
+| `file:unlink` | File deleted (watcher) |
+| `put` | Data stored via API |
+| `delete` | Data deleted via API |
+| `synced` | Remote backend sync completed |
+| `scan:start/complete` | Backend scan lifecycle |

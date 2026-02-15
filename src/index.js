@@ -3,6 +3,7 @@ import Debug from 'debug';
 import Cache from './cache/index.js';
 import BackendManager from './backends/BackendManager.js';
 import Index from './index/index.js';
+import SyncQueue from './sync/SyncQueue.js';
 import { isBuffer, isFile, isStream } from './utils/common.js';
 import { checksumBuffer, checksumFile, formatId } from './utils/checksum.js';
 import { detectMimeType } from './utils/mime.js';
@@ -14,6 +15,7 @@ export default class Stored extends EventEmitter {
     #backends;
     #index;
     #config;
+    #syncQueue;
 
     constructor(config = {}) {
         super();
@@ -24,9 +26,17 @@ export default class Stored extends EventEmitter {
             ...config,
         };
 
-        this.#cache = config.cache?.path ? new Cache(config.cache) : null;
+        // Cache is mandatory — derive path from index path if not provided
+        const cachePath = config.cache?.path || (config.index?.path ? config.index.path + '-cache' : './.stored-cache');
+        this.#cache = new Cache({ path: cachePath, algorithms: config.checksums || ['sha256'] });
+
         this.#backends = new BackendManager();
         this.#index = new Index(config.index?.path);
+
+        // Background sync queue for remote backends (worker spawned lazily)
+        this.#syncQueue = new SyncQueue();
+        this.#syncQueue.on('synced', ({ id, results }) => this.#handleSyncResult(id, results));
+        this.#syncQueue.on('error', (err) => this.emit('error', err));
 
         debug('Stored initialized');
     }
@@ -62,7 +72,7 @@ export default class Stored extends EventEmitter {
     getBackend(name) { return this.#backends.get(name); }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Core API
+    // Core API — cache-first writes, cache-first reads
     // ─────────────────────────────────────────────────────────────────────────
 
     async put(blob, options = {}) {
@@ -72,40 +82,75 @@ export default class Stored extends EventEmitter {
         const id = formatId(checksums, this.#config.primaryChecksum);
         const finalKey = key || this.#generateKey(checksums);
 
-        // Write to backends
-        const locations = [];
-        const targetBackends = backends.length ? backends : this.#backends.list();
+        // 1. Write to cache first (always, fast)
+        await this.#cache.put(id, data, { key: finalKey, checksums, size, mimeType });
 
-        for (const backendName of targetBackends) {
-            const backend = this.#backends.get(backendName);
+        // 2. Write to backends — local immediately, remote via queue
+        const targetNames = backends.length ? backends : this.#backends.list();
+        const locations = [];
+        const remoteTargets = [];
+
+        for (const name of targetNames) {
+            const backend = this.#backends.get(name);
             if (!backend) continue;
-            await backend.put(finalKey, data);
-            locations.push({ backend: backendName, key: finalKey, synced: true });
+
+            if (backend.type === 'local') {
+                await backend.put(finalKey, data);
+                locations.push({ backend: name, key: finalKey, synced: true });
+            } else {
+                locations.push({ backend: name, key: finalKey, synced: false });
+                remoteTargets.push({ name, driver: backend.config.driver, root: backend.config.root, key: finalKey });
+            }
         }
 
+        // 3. Update index
         const meta = this.#index.put(id, { checksums, size, mimeType, locations, custom: metadata });
 
+        // 4. Enqueue remote backend sync
+        if (remoteTargets.length) {
+            this.#syncQueue.enqueue({ id, cacheRoot: this.#cache.root, cacheKey: id, targets: remoteTargets });
+        }
+
         this.emit('put', { id, key: finalKey, metadata: meta });
-        debug(`PUT ${id.slice(0, 19)}... → ${targetBackends.join(', ')}`);
+        debug(`PUT ${id.slice(0, 19)}... → cache + ${targetNames.join(', ')}`);
         return meta;
     }
 
     async get(idOrKey, options = {}) {
         const meta = this.#index.get(idOrKey);
-        if (!meta) return null;
 
+        // 1. Try cache by content ID
+        if (meta) {
+            try {
+                const { data } = await this.#cache.get(meta.id);
+                return data;
+            } catch { /* cache miss */ }
+        }
+
+        // 2. Backend fallback
+        if (!meta) return null;
         const location = meta.locations?.find(l => l.synced);
         if (!location) return null;
 
         const backend = this.#backends.get(location.backend);
         if (!backend) return null;
 
-        return backend.get(location.key, options);
+        const data = await backend.get(location.key, options);
+
+        // 3. Cache on read
+        if (data && Buffer.isBuffer(data)) {
+            this.#cache.put(meta.id, data).catch(() => {});
+        }
+
+        return data;
     }
 
     async delete(idOrKey, options = {}) {
         const meta = this.#index.get(idOrKey);
         if (!meta) return { deleted: [] };
+
+        // Remove from cache
+        this.#cache.delete(meta.id).catch(() => {});
 
         const targets = options.backends
             ? meta.locations.filter(l => options.backends.includes(l.backend))
@@ -162,7 +207,6 @@ export default class Stored extends EventEmitter {
                     const existing = this.#index.get(id);
                     const location = { backend: file.backend, key: file.key, synced: true };
 
-                    // Merge locations
                     const locations = existing?.locations || [];
                     if (!locations.some(l => l.backend === file.backend && l.key === file.key)) {
                         locations.push(location);
@@ -186,13 +230,32 @@ export default class Stored extends EventEmitter {
     // ─────────────────────────────────────────────────────────────────────────
 
     async stop() {
+        await this.#syncQueue.stop();
         await this.#backends.stopAll();
         this.#index.close();
         debug('Stopped');
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Private Helpers
+    // Private — sync result handling
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #handleSyncResult(id, results) {
+        const meta = this.#index.get(id);
+        if (!meta) return;
+
+        for (const r of results) {
+            if (!r.success) continue;
+            const loc = meta.locations.find(l => l.backend === r.backend);
+            if (loc) loc.synced = true;
+        }
+
+        this.#index.put(meta.id, meta);
+        this.emit('synced', { id, results });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Private — blob normalization & helpers
     // ─────────────────────────────────────────────────────────────────────────
 
     async #normalizeBlob(blob) {
@@ -238,7 +301,6 @@ export default class Stored extends EventEmitter {
             const id = formatId(data.checksums, this.#config.primaryChecksum);
             const existing = this.#index.get(id);
 
-            // Merge locations - same content might exist in multiple paths
             const locations = existing?.locations || [];
             if (!locations.some(l => l.backend === data.backend && l.key === data.key)) {
                 locations.push(location);
@@ -253,8 +315,6 @@ export default class Stored extends EventEmitter {
             this.emit(event, { ...data, id, locations });
 
         } else if (event === 'file:change' && data.checksums) {
-            // File changed = content changed = new checksum
-            // First, remove old location from previous checksum entry
             const oldMeta = this.#index.get(pathKey);
             if (oldMeta) {
                 oldMeta.locations = oldMeta.locations.filter(l =>
@@ -265,11 +325,9 @@ export default class Stored extends EventEmitter {
                 } else {
                     this.#index.put(oldMeta.id, oldMeta);
                 }
-                // Emit that old content was removed from this path
                 this.emit('file:unlink', { ...data, id: oldMeta.id, checksums: oldMeta.checksums });
             }
 
-            // Then add new location to new checksum entry
             const newId = formatId(data.checksums, this.#config.primaryChecksum);
             const existing = this.#index.get(newId);
             const locations = existing?.locations || [];
@@ -286,7 +344,6 @@ export default class Stored extends EventEmitter {
             this.emit('file:add', { ...data, id: newId, locations });
 
         } else if (event === 'file:unlink') {
-            // Lookup metadata from index before removal (file is gone, no checksums)
             const meta = this.#index.get(pathKey);
             if (meta) {
                 meta.locations = meta.locations.filter(l =>
@@ -297,7 +354,6 @@ export default class Stored extends EventEmitter {
                 } else {
                     this.#index.put(meta.id, meta);
                 }
-                // Emit with full metadata so consumers know what was removed
                 this.emit(event, { ...data, id: meta.id, checksums: meta.checksums, locations: meta.locations });
             } else {
                 this.emit(event, data);
