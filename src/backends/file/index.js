@@ -12,6 +12,7 @@ export default class FileBackend extends StorageBackend {
     #root;
     #watcher = null;
     #watchEnabled;
+    #ignored;
     #defaultAlgorithms = ['sha256'];
 
     constructor(name, config = {}) {
@@ -19,6 +20,7 @@ export default class FileBackend extends StorageBackend {
         if (!config.root) throw new Error('FileBackend requires root path');
         this.#root = path.resolve(config.root);
         this.#watchEnabled = config.watch ?? false;
+        this.#ignored = config.ignored || null;
         this.#defaultAlgorithms = config.algorithms || ['sha256'];
         this.type = 'local';
         fs.ensureDirSync(this.#root);
@@ -88,11 +90,14 @@ export default class FileBackend extends StorageBackend {
     async watch() {
         if (this.#watcher) return true;
 
-        this.#watcher = chokidar.watch(this.#root, {
+        const watchOpts = {
             persistent: true,
             ignoreInitial: true,
             awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
-        });
+        };
+        if (this.#ignored) watchOpts.ignored = this.#ignored;
+
+        this.#watcher = chokidar.watch(this.#root, watchOpts);
 
         const toKey = p => path.relative(this.#root, p);
 
