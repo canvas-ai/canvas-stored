@@ -118,17 +118,20 @@ export default class Stored extends EventEmitter {
 
     async get(idOrKey, options = {}) {
         const meta = this.#index.get(idOrKey);
+        if (!meta) return null;
 
-        // 1. Try cache by content ID
-        if (meta) {
+        // 1. Cache by content ID
+        if (options.stream) {
             try {
-                const { data } = await this.#cache.get(meta.id);
-                return data;
+                return this.#cache.getStream(meta.id);
             } catch { /* cache miss */ }
         }
+        try {
+            const { data } = await this.#cache.get(meta.id);
+            return data;
+        } catch { /* cache miss */ }
 
         // 2. Backend fallback
-        if (!meta) return null;
         const location = meta.locations?.find(l => l.synced);
         if (!location) return null;
 
@@ -137,7 +140,7 @@ export default class Stored extends EventEmitter {
 
         const data = await backend.get(location.key, options);
 
-        // 3. Cache on read
+        // 3. Cache on read (buffer only)
         if (data && Buffer.isBuffer(data)) {
             this.#cache.put(meta.id, data).catch(() => {});
         }
