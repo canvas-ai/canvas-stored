@@ -69,6 +69,12 @@ describe('Stored', async () => {
             assert.strictEqual(meta.size, 12);
             assert.ok(meta.mimeType);
             assert.ok(meta.locations.length > 0);
+            assert.deepStrictEqual(meta.locations[0].source, {
+                provider: 'fs',
+                account: 'test',
+                container: 'test-fixtures',
+                path: 'buffer.txt',
+            });
             assert.ok(meta.created);
             assert.ok(meta.modified);
         });
@@ -233,6 +239,12 @@ describe('Stored', async () => {
                 const id = `sha256:${file.checksums.sha256}`;
                 const meta = stored.stat(id);
                 assert.ok(meta);
+                assert.deepStrictEqual(meta.locations[0].source, {
+                    provider: 'fs',
+                    account: 'test',
+                    container: 'test-fixtures',
+                    path: 'scan1.txt',
+                });
             }
         });
     });

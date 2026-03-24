@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import path from 'path';
 import Debug from 'debug';
 import Cache from './cache/index.js';
 import BackendManager from './backends/BackendManager.js';
@@ -96,9 +97,9 @@ export default class Stored extends EventEmitter {
 
             if (backend.type === 'local') {
                 await backend.put(finalKey, data);
-                locations.push({ backend: name, key: finalKey, synced: true });
+                locations.push(this.#buildLocation(name, finalKey, true));
             } else {
-                locations.push({ backend: name, key: finalKey, synced: false });
+                locations.push(this.#buildLocation(name, finalKey, false));
                 remoteTargets.push({ name, driver: backend.config.driver, root: backend.config.root, key: finalKey });
             }
         }
@@ -208,7 +209,7 @@ export default class Stored extends EventEmitter {
                 if (file.checksums) {
                     const id = formatId(file.checksums, this.#config.primaryChecksum);
                     const existing = this.#index.get(id);
-                    const location = { backend: file.backend, key: file.key, synced: true };
+                    const location = this.#buildLocation(file.backend, file.key, true);
 
                     const locations = existing?.locations || [];
                     if (!locations.some(l => l.backend === file.backend && l.key === file.key)) {
@@ -296,9 +297,41 @@ export default class Stored extends EventEmitter {
         return `${hash.slice(0, 2)}/${hash.slice(2, 4)}/${hash}`;
     }
 
+    #buildLocation(backendName, key, synced) {
+        const backend = this.#backends.get(backendName);
+        const config = backend?.config || {};
+
+        return {
+            backend: backendName,
+            driver: config.driver || null,
+            key,
+            synced,
+            source: this.#buildSourceDescriptor(backendName, key, config),
+        };
+    }
+
+    #buildSourceDescriptor(backendName, key, config = {}) {
+        const [providerHint, ...accountHintParts] = String(backendName || '').split(':').filter(Boolean);
+        const provider = config.provider || providerHint || config.driver || 'unknown';
+        const account = config.account
+            || (accountHintParts.length > 0 ? accountHintParts.join(':') : (providerHint || backendName || 'default'));
+        const container = config.container
+            || config.bucket
+            || config.share
+            || config.folder
+            || (config.root ? path.basename(path.resolve(config.root)) : 'root');
+
+        return {
+            provider,
+            account,
+            container,
+            path: key,
+        };
+    }
+
     #handleFileEvent(event, data) {
         const pathKey = `${data.backend}:${data.key}`;
-        const location = { backend: data.backend, key: data.key, synced: true };
+        const location = this.#buildLocation(data.backend, data.key, true);
 
         if (event === 'file:add' && data.checksums) {
             const id = formatId(data.checksums, this.#config.primaryChecksum);
